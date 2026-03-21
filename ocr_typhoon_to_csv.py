@@ -296,6 +296,19 @@ def strip_html_tags(text: str) -> str:
     return normalize_text(html.unescape(HTML_TAG_PATTERN.sub(" ", text)))
 
 
+def looks_like_non_result_row(text: str) -> bool:
+    normalized = normalize_text(text).lower()
+    noise_keywords = (
+        "รวมคะแนนทั้งสิ้น",
+        "คะแนนทั้งหมด",
+        "ประกาศ ณ วันที่",
+        "ลงชื่อ",
+        "ประธานกรรมการ",
+        "กรรมการการเลือกตั้ง",
+    )
+    return any(keyword in normalized for keyword in noise_keywords)
+
+
 def build_row_from_cells(
     cells: list[str],
     id_doc: str,
@@ -309,24 +322,45 @@ def build_row_from_cells(
         return None
 
     row_num = digits_only(normalized_cells[0])
-    if not row_num:
-        return None
-
     vote_idx: int | None = None
-    for idx in range(len(normalized_cells) - 1, 0, -1):
-        if digits_only(normalized_cells[idx]):
-            vote_idx = idx
-            break
-    if vote_idx is None or vote_idx < 1:
-        return None
+    party_idx: int | None = None
 
-    party_idx = vote_idx - 1
-    if party_idx < 1:
+    if is_party_list_doc(id_doc):
+        if row_num:
+            if len(normalized_cells) >= 3:
+                party_idx = 1
+                vote_idx = 2
+        else:
+            if len(normalized_cells) >= 2:
+                party_idx = 0
+                vote_idx = 1
+    else:
+        if not row_num or len(normalized_cells) < 4:
+            return None
+
+        if (
+            len(normalized_cells) >= 5
+            and digits_only(normalized_cells[-1])
+            and digits_only(normalized_cells[-2])
+            and len(digits_only(normalized_cells[-1])) <= 2
+        ):
+            party_idx = 2
+            vote_idx = len(normalized_cells) - 2
+        else:
+            for idx in range(len(normalized_cells) - 1, 0, -1):
+                if digits_only(normalized_cells[idx]):
+                    vote_idx = idx
+                    break
+            if vote_idx is None or vote_idx < 1:
+                return None
+            party_idx = 2 if len(normalized_cells) >= 4 else vote_idx - 1
+
+    if vote_idx is None or party_idx is None:
         return None
 
     party_name = normalize_text(normalized_cells[party_idx])
     vote = digits_only(normalized_cells[vote_idx])
-    if not party_name or not vote:
+    if not party_name or not vote or looks_like_non_result_row(party_name):
         return None
 
     record_key = (row_num, party_name, vote)
@@ -341,6 +375,60 @@ def build_row_from_cells(
         vote=vote,
         source_file=source_file,
     )
+
+
+def fill_missing_row_numbers(rows: list[ParsedRow]) -> list[ParsedRow]:
+    grouped: dict[str, list[ParsedRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.id_doc, []).append(row)
+
+    completed_rows: list[ParsedRow] = []
+    for id_doc, doc_rows in grouped.items():
+        if not is_party_list_doc(id_doc):
+            completed_rows.extend(doc_rows)
+            continue
+
+        pending_indexes: list[int] = []
+        previous_number: int | None = None
+        doc_rows_copy = list(doc_rows)
+
+        for index, row in enumerate(doc_rows_copy):
+            if row.row_num:
+                current_number = int(row.row_num)
+                if pending_indexes:
+                    if previous_number is not None:
+                        gap = current_number - previous_number - 1
+                        if gap > 0:
+                            assignable = min(len(pending_indexes), gap)
+                            for offset, pending_index in enumerate(pending_indexes[:assignable], start=1):
+                                pending_row = doc_rows_copy[pending_index]
+                                doc_rows_copy[pending_index] = ParsedRow(
+                                    id_doc=pending_row.id_doc,
+                                    row_num=str(previous_number + offset),
+                                    party_name=pending_row.party_name,
+                                    vote=pending_row.vote,
+                                    source_file=pending_row.source_file,
+                                )
+                    pending_indexes = []
+                previous_number = current_number
+                continue
+
+            pending_indexes.append(index)
+
+        if pending_indexes and previous_number is not None:
+            for offset, pending_index in enumerate(pending_indexes, start=1):
+                pending_row = doc_rows_copy[pending_index]
+                doc_rows_copy[pending_index] = ParsedRow(
+                    id_doc=pending_row.id_doc,
+                    row_num=str(previous_number + offset),
+                    party_name=pending_row.party_name,
+                    vote=pending_row.vote,
+                    source_file=pending_row.source_file,
+                )
+
+        completed_rows.extend(doc_rows_copy)
+
+    return completed_rows
 
 
 def parse_html_table(markdown: str, id_doc: str, source_file: str) -> list[ParsedRow]:
@@ -523,6 +611,7 @@ def main() -> int:
         for file_index in sorted(rows_by_file_index):
             all_rows.extend(rows_by_file_index[file_index])
 
+    all_rows = fill_missing_row_numbers(all_rows)
     write_csv(all_rows, args.output_csv)
     print(f"[INFO] Wrote {len(all_rows)} rows to {args.output_csv}")
     return 0
