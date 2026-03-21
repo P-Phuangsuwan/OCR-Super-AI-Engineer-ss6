@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import re
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".pdf"}
 PAGE_SUFFIX_PATTERN = re.compile(r"^(?P<base>.+?)(?:_page(?P<page>\d+))?$", re.IGNORECASE)
 TABLE_SEPARATOR_PATTERN = re.compile(r"^[\s\-\|\:]+$")
+HTML_ROW_PATTERN = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+HTML_CELL_PATTERN = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 @dataclass(frozen=True)
@@ -22,6 +29,31 @@ class ParsedRow:
     party_name: str
     vote: str
     source_file: str
+
+
+class RateLimiter:
+    def __init__(self, max_requests_per_minute: int) -> None:
+        self.max_requests_per_minute = max_requests_per_minute
+        self._lock = threading.Lock()
+        self._request_times: deque[float] = deque()
+
+    def wait_for_turn(self) -> None:
+        if self.max_requests_per_minute <= 0:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._request_times and now - self._request_times[0] >= 60.0:
+                    self._request_times.popleft()
+
+                if len(self._request_times) < self.max_requests_per_minute:
+                    self._request_times.append(now)
+                    return
+
+                wait_seconds = 60.0 - (now - self._request_times[0])
+
+            time.sleep(max(wait_seconds, 0.05))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +100,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional limit for the number of input files, useful while testing.",
     )
+    parser.add_argument(
+        "--page-mode",
+        choices=["all", "likely-tables"],
+        default="all",
+        help="Choose whether to OCR all pages or only pages most likely to contain result tables.",
+    )
+    parser.add_argument(
+        "--workers",
+        default=1,
+        type=int,
+        help="Number of concurrent OCR workers. Default: 1",
+    )
+    parser.add_argument(
+        "--max-requests-per-minute",
+        default=20,
+        type=int,
+        help="Global rate limit for OCR request starts across all workers. Default: 20",
+    )
     return parser
 
 
@@ -104,15 +154,45 @@ def derive_page_num(file_path: Path) -> int:
     return int(match.group("page"))
 
 
-def iter_input_files(input_dir: Path) -> list[Path]:
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"Input path is not a folder: {input_dir}")
+def is_party_list_doc(id_doc: str) -> bool:
+    return id_doc.lower().startswith("party_list_")
 
-    files = [path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES]
+
+def select_likely_table_pages(files: list[Path]) -> list[Path]:
+    grouped: dict[str, list[Path]] = {}
+    for file_path in files:
+        grouped.setdefault(derive_id_doc(file_path), []).append(file_path)
+
+    selected: list[Path] = []
+    for id_doc, group_files in grouped.items():
+        if is_party_list_doc(id_doc):
+            later_pages = [path for path in group_files if derive_page_num(path) >= 2]
+            if later_pages:
+                selected.extend(
+                    sorted(
+                        later_pages,
+                        key=lambda path: (
+                            derive_page_num(path),
+                            path.name.lower(),
+                        ),
+                    )
+                )
+                continue
+
+        page_two = [path for path in group_files if derive_page_num(path) == 2]
+        if page_two:
+            selected.append(sorted(page_two, key=lambda path: natural_sort_key(path.name))[0])
+            continue
+
+        page_one = [path for path in group_files if derive_page_num(path) == 1]
+        if page_one:
+            selected.append(sorted(page_one, key=lambda path: natural_sort_key(path.name))[0])
+            continue
+
+        selected.extend(sorted(group_files, key=lambda path: natural_sort_key(path.name))[:1])
+
     return sorted(
-        files,
+        selected,
         key=lambda path: (
             natural_sort_key(derive_id_doc(path)),
             derive_page_num(path),
@@ -121,7 +201,33 @@ def iter_input_files(input_dir: Path) -> list[Path]:
     )
 
 
-def get_ocr_markdown(pdf_or_image_path: Path, cache_path: Path, overwrite_cache: bool, retries: int) -> str:
+def iter_input_files(input_dir: Path, page_mode: str = "all") -> list[Path]:
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a folder: {input_dir}")
+
+    files = [path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES]
+    files = sorted(
+        files,
+        key=lambda path: (
+            natural_sort_key(derive_id_doc(path)),
+            derive_page_num(path),
+            path.name.lower(),
+        ),
+    )
+    if page_mode == "likely-tables":
+        return select_likely_table_pages(files)
+    return files
+
+
+def get_ocr_markdown(
+    pdf_or_image_path: Path,
+    cache_path: Path,
+    overwrite_cache: bool,
+    retries: int,
+    before_request: callable | None = None,
+) -> str:
     if cache_path.exists() and not overwrite_cache:
         return cache_path.read_text(encoding="utf-8")
 
@@ -136,6 +242,8 @@ def get_ocr_markdown(pdf_or_image_path: Path, cache_path: Path, overwrite_cache:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
+            if before_request is not None:
+                before_request()
             markdown = str(ocr_document(pdf_or_image_path=str(pdf_or_image_path)))
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(markdown, encoding="utf-8")
@@ -173,6 +281,75 @@ def looks_like_header(cells: list[str]) -> bool:
     return any(keyword in joined for keyword in header_keywords)
 
 
+def strip_html_tags(text: str) -> str:
+    return normalize_text(html.unescape(HTML_TAG_PATTERN.sub(" ", text)))
+
+
+def build_row_from_cells(
+    cells: list[str],
+    id_doc: str,
+    source_file: str,
+    seen: set[tuple[str, str, str]],
+) -> ParsedRow | None:
+    normalized_cells = [normalize_text(cell) for cell in cells]
+    if len(normalized_cells) < 3:
+        return None
+    if looks_like_header(normalized_cells):
+        return None
+
+    row_num = digits_only(normalized_cells[0])
+    if not row_num:
+        return None
+
+    vote_idx: int | None = None
+    for idx in range(len(normalized_cells) - 1, 0, -1):
+        if digits_only(normalized_cells[idx]):
+            vote_idx = idx
+            break
+    if vote_idx is None or vote_idx < 1:
+        return None
+
+    party_idx = vote_idx - 1
+    if party_idx < 1:
+        return None
+
+    party_name = normalize_text(normalized_cells[party_idx])
+    vote = digits_only(normalized_cells[vote_idx])
+    if not party_name or not vote:
+        return None
+
+    record_key = (row_num, party_name, vote)
+    if record_key in seen:
+        return None
+    seen.add(record_key)
+
+    return ParsedRow(
+        id_doc=id_doc,
+        row_num=row_num,
+        party_name=party_name,
+        vote=vote,
+        source_file=source_file,
+    )
+
+
+def parse_html_table(markdown: str, id_doc: str, source_file: str) -> list[ParsedRow]:
+    rows: list[ParsedRow] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for row_html in HTML_ROW_PATTERN.findall(markdown):
+        cells = [strip_html_tags(cell) for cell in HTML_CELL_PATTERN.findall(row_html)]
+        parsed = build_row_from_cells(
+            cells=cells,
+            id_doc=id_doc,
+            source_file=source_file,
+            seen=seen,
+        )
+        if parsed is not None:
+            rows.append(parsed)
+
+    return rows
+
+
 def parse_markdown_table(markdown: str, id_doc: str, source_file: str) -> list[ParsedRow]:
     rows: list[ParsedRow] = []
     seen: set[tuple[str, str, str]] = set()
@@ -185,31 +362,14 @@ def parse_markdown_table(markdown: str, id_doc: str, source_file: str) -> list[P
             continue
 
         cells = [normalize_text(cell) for cell in line.strip("|").split("|")]
-        if len(cells) < 4:
-            continue
-        if looks_like_header(cells):
-            continue
-
-        row_num = digits_only(cells[0])
-        party_name = normalize_text(cells[-2])
-        vote = digits_only(cells[-1])
-        if not row_num or not party_name or not vote:
-            continue
-
-        record_key = (row_num, party_name, vote)
-        if record_key in seen:
-            continue
-        seen.add(record_key)
-
-        rows.append(
-            ParsedRow(
-                id_doc=id_doc,
-                row_num=row_num,
-                party_name=party_name,
-                vote=vote,
-                source_file=source_file,
-            )
+        parsed = build_row_from_cells(
+            cells=cells,
+            id_doc=id_doc,
+            source_file=source_file,
+            seen=seen,
         )
+        if parsed is not None:
+            rows.append(parsed)
 
     return rows
 
@@ -226,34 +386,23 @@ def parse_plain_text(markdown: str, id_doc: str, source_file: str) -> list[Parse
             continue
 
         parts = [normalize_text(part) for part in re.split(r"\s{2,}", line) if normalize_text(part)]
-        if len(parts) < 3:
-            continue
-
-        row_num = digits_only(parts[0])
-        party_name = normalize_text(parts[-2])
-        vote = digits_only(parts[-1])
-        if not row_num or not party_name or not vote:
-            continue
-
-        record_key = (row_num, party_name, vote)
-        if record_key in seen:
-            continue
-        seen.add(record_key)
-
-        rows.append(
-            ParsedRow(
-                id_doc=id_doc,
-                row_num=row_num,
-                party_name=party_name,
-                vote=vote,
-                source_file=source_file,
-            )
+        parsed = build_row_from_cells(
+            cells=parts,
+            id_doc=id_doc,
+            source_file=source_file,
+            seen=seen,
         )
+        if parsed is not None:
+            rows.append(parsed)
 
     return rows
 
 
 def extract_rows(markdown: str, id_doc: str, source_file: str) -> list[ParsedRow]:
+    rows = parse_html_table(markdown, id_doc=id_doc, source_file=source_file)
+    if rows:
+        return rows
+
     rows = parse_markdown_table(markdown, id_doc=id_doc, source_file=source_file)
     if rows:
         return rows
@@ -280,37 +429,88 @@ def write_csv(rows: Iterable[ParsedRow], output_csv: Path) -> None:
             )
 
 
+def process_one_file(
+    file_index: int,
+    total_files: int,
+    input_file: Path,
+    cache_dir: Path,
+    overwrite_cache: bool,
+    retries: int,
+    rate_limiter: RateLimiter,
+) -> tuple[int, list[ParsedRow]]:
+    id_doc = derive_id_doc(input_file)
+    cache_path = cache_dir / f"{input_file.stem}.md"
+    cache_hit = cache_path.exists() and not overwrite_cache
+    print(f"[INFO] ({file_index}/{total_files}) OCR: {input_file.name}")
+
+    markdown = get_ocr_markdown(
+        pdf_or_image_path=input_file,
+        cache_path=cache_path,
+        overwrite_cache=overwrite_cache,
+        retries=retries,
+        before_request=None if cache_hit else rate_limiter.wait_for_turn,
+    )
+    extracted_rows = extract_rows(
+        markdown=markdown,
+        id_doc=id_doc,
+        source_file=input_file.name,
+    )
+    print(f"[INFO]     Extracted {len(extracted_rows)} rows from {input_file.name}")
+    return file_index, extracted_rows
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    input_files = iter_input_files(args.input_dir)
+    input_files = iter_input_files(args.input_dir, page_mode=args.page_mode)
     if args.max_files is not None:
         input_files = input_files[: args.max_files]
 
-    print(f"[INFO] Found {len(input_files)} files in {args.input_dir}")
-    all_rows: list[ParsedRow] = []
+    print(
+        f"[INFO] Found {len(input_files)} files in {args.input_dir} "
+        f"(page_mode={args.page_mode}, workers={args.workers})"
+    )
+    rate_limiter = RateLimiter(args.max_requests_per_minute)
 
-    for index, input_file in enumerate(input_files, start=1):
-        id_doc = derive_id_doc(input_file)
-        cache_path = args.cache_dir / f"{input_file.stem}.md"
-        cache_hit = cache_path.exists() and not args.overwrite_cache
-        print(f"[INFO] ({index}/{len(input_files)}) OCR: {input_file.name}")
+    if args.workers <= 1:
+        all_rows: list[ParsedRow] = []
+        for index, input_file in enumerate(input_files, start=1):
+            _, extracted_rows = process_one_file(
+                file_index=index,
+                total_files=len(input_files),
+                input_file=input_file,
+                cache_dir=args.cache_dir,
+                overwrite_cache=args.overwrite_cache,
+                retries=args.retries,
+                rate_limiter=rate_limiter,
+            )
+            all_rows.extend(extracted_rows)
+            cache_path = args.cache_dir / f"{input_file.stem}.md"
+            cache_hit = cache_path.exists() and not args.overwrite_cache
+            if not cache_hit and args.sleep_seconds > 0 and index < len(input_files):
+                time.sleep(args.sleep_seconds)
+    else:
+        rows_by_file_index: dict[int, list[ParsedRow]] = {}
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {
+                executor.submit(
+                    process_one_file,
+                    index,
+                    len(input_files),
+                    input_file,
+                    args.cache_dir,
+                    args.overwrite_cache,
+                    args.retries,
+                    rate_limiter,
+                ): index
+                for index, input_file in enumerate(input_files, start=1)
+            }
+            for future in as_completed(future_map):
+                file_index, extracted_rows = future.result()
+                rows_by_file_index[file_index] = extracted_rows
 
-        markdown = get_ocr_markdown(
-            pdf_or_image_path=input_file,
-            cache_path=cache_path,
-            overwrite_cache=args.overwrite_cache,
-            retries=args.retries,
-        )
-        extracted_rows = extract_rows(
-            markdown=markdown,
-            id_doc=id_doc,
-            source_file=input_file.name,
-        )
-        print(f"[INFO]     Extracted {len(extracted_rows)} rows from {input_file.name}")
-        all_rows.extend(extracted_rows)
-
-        if not cache_hit and index < len(input_files):
-            time.sleep(args.sleep_seconds)
+        all_rows = []
+        for file_index in sorted(rows_by_file_index):
+            all_rows.extend(rows_by_file_index[file_index])
 
     write_csv(all_rows, args.output_csv)
     print(f"[INFO] Wrote {len(all_rows)} rows to {args.output_csv}")
