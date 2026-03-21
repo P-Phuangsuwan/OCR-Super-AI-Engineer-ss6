@@ -165,12 +165,19 @@ def select_likely_table_pages(files: list[Path]) -> list[Path]:
 
     selected: list[Path] = []
     for id_doc, group_files in grouped.items():
+        sorted_group_files = sorted(group_files, key=lambda path: natural_sort_key(path.name))
         if is_party_list_doc(id_doc):
-            later_pages = [path for path in group_files if derive_page_num(path) >= 2]
-            if later_pages:
+            # Most party-list documents keep the result table on pages 2-5, but
+            # shorter files sometimes start directly on page 1 and continue on
+            # page 2/3 without a separate cover page.
+            table_pages = [path for path in sorted_group_files if 2 <= derive_page_num(path) <= 5]
+            page_one = [path for path in sorted_group_files if derive_page_num(path) == 1]
+            if page_one and len(sorted_group_files) <= 3:
+                table_pages = page_one + table_pages
+            if table_pages:
                 selected.extend(
                     sorted(
-                        later_pages,
+                        table_pages,
                         key=lambda path: (
                             derive_page_num(path),
                             path.name.lower(),
@@ -179,17 +186,17 @@ def select_likely_table_pages(files: list[Path]) -> list[Path]:
                 )
                 continue
 
-        page_two = [path for path in group_files if derive_page_num(path) == 2]
+        page_two = [path for path in sorted_group_files if derive_page_num(path) == 2]
         if page_two:
             selected.append(sorted(page_two, key=lambda path: natural_sort_key(path.name))[0])
             continue
 
-        page_one = [path for path in group_files if derive_page_num(path) == 1]
+        page_one = [path for path in sorted_group_files if derive_page_num(path) == 1]
         if page_one:
             selected.append(sorted(page_one, key=lambda path: natural_sort_key(path.name))[0])
             continue
 
-        selected.extend(sorted(group_files, key=lambda path: natural_sort_key(path.name))[:1])
+        selected.extend(sorted_group_files[:1])
 
     return sorted(
         selected,
@@ -250,7 +257,11 @@ def get_ocr_markdown(
             return markdown
         except Exception as exc:  # pragma: no cover - depends on remote API
             last_error = exc
-            wait_seconds = min(12.0, 2.0 * attempt)
+            error_text = str(exc).lower()
+            if "rate exceeded" in error_text or "ratelimit" in error_text:
+                wait_seconds = min(90.0, 20.0 * attempt)
+            else:
+                wait_seconds = min(12.0, 2.0 * attempt)
             print(
                 f"[WARN] OCR failed for {pdf_or_image_path.name} "
                 f"(attempt {attempt}/{retries}): {exc}",
