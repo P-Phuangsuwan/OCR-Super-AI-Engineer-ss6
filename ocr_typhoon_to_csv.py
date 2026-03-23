@@ -118,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Global rate limit for OCR request starts across all workers. Default: 20",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Log OCR failures and continue with the remaining files instead of aborting the whole batch.",
+    )
     return parser
 
 
@@ -259,7 +264,11 @@ def get_ocr_markdown(
             last_error = exc
             error_text = str(exc).lower()
             if "rate exceeded" in error_text or "ratelimit" in error_text:
-                wait_seconds = min(90.0, 20.0 * attempt)
+                wait_seconds = min(180.0, 30.0 * attempt)
+            elif "timed out" in error_text or "error code: 408" in error_text:
+                wait_seconds = min(150.0, 25.0 * attempt)
+            elif "server error" in error_text or "can't process the request" in error_text or "error code: 500" in error_text:
+                wait_seconds = min(150.0, 25.0 * attempt)
             else:
                 wait_seconds = min(12.0, 2.0 * attempt)
             print(
@@ -536,19 +545,27 @@ def process_one_file(
     overwrite_cache: bool,
     retries: int,
     rate_limiter: RateLimiter,
+    continue_on_error: bool,
 ) -> tuple[int, list[ParsedRow]]:
     id_doc = derive_id_doc(input_file)
     cache_path = cache_dir / f"{input_file.stem}.md"
     cache_hit = cache_path.exists() and not overwrite_cache
     print(f"[INFO] ({file_index}/{total_files}) OCR: {input_file.name}")
 
-    markdown = get_ocr_markdown(
-        pdf_or_image_path=input_file,
-        cache_path=cache_path,
-        overwrite_cache=overwrite_cache,
-        retries=retries,
-        before_request=None if cache_hit else rate_limiter.wait_for_turn,
-    )
+    try:
+        markdown = get_ocr_markdown(
+            pdf_or_image_path=input_file,
+            cache_path=cache_path,
+            overwrite_cache=overwrite_cache,
+            retries=retries,
+            before_request=None if cache_hit else rate_limiter.wait_for_turn,
+        )
+    except Exception as exc:
+        if not continue_on_error:
+            raise
+        print(f"[ERROR] Skipping {input_file.name}: {exc}", file=sys.stderr)
+        return file_index, []
+
     extracted_rows = extract_rows(
         markdown=markdown,
         id_doc=id_doc,
@@ -581,6 +598,7 @@ def main() -> int:
                 overwrite_cache=args.overwrite_cache,
                 retries=args.retries,
                 rate_limiter=rate_limiter,
+                continue_on_error=args.continue_on_error,
             )
             all_rows.extend(extracted_rows)
             cache_path = args.cache_dir / f"{input_file.stem}.md"
@@ -600,6 +618,7 @@ def main() -> int:
                     args.overwrite_cache,
                     args.retries,
                     rate_limiter,
+                    args.continue_on_error,
                 ): index
                 for index, input_file in enumerate(input_files, start=1)
             }

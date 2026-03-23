@@ -7,9 +7,18 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from collections import defaultdict
 
 
 PUNCTUATION_PATTERN = re.compile(r"[\s\-\.,/()_:;'\"]+")
+NUMBER_FRAGMENT_PATTERN = re.compile(r"[0-9๐-๙,]{2,}")
+THAI_DIGIT_TRANSLATION = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+GOOD_BALLOT_MARKER = "\u0e1a\u0e31\u0e15\u0e23\u0e14\u0e35"
+PAGE1_CACHE_DIRS = (
+    Path("temp_constituency_page1_missing_cache"),
+    Path("temp_constituency_page1_cache"),
+    Path("ocr_cache"),
+)
 COMMON_NAME_REPLACEMENTS = {
     "ประชาธิปัตย์ใหม่": "ประชาธิปไตยใหม่",
     "สังคมประชาธิปัตย์ใหม่": "สังคมประชาธิปไตยไทย",
@@ -45,6 +54,34 @@ class MatchResult:
     score: float
     matched_row_num: str
     matched_party_name: str
+
+
+def extract_numeric_fragment(value: str) -> int | None:
+    normalized = value.translate(THAI_DIGIT_TRANSLATION)
+    digits_only = re.sub(r"[^0-9]", "", normalized)
+    return int(digits_only) if digits_only else None
+
+
+def extract_good_ballots_from_page_cache(id_doc: str) -> int | None:
+    for cache_dir in PAGE1_CACHE_DIRS:
+        for candidate_name in (f"{id_doc}.md", f"{id_doc}_page1.md"):
+            cache_path = cache_dir / candidate_name
+            if not cache_path.exists():
+                continue
+
+            text = cache_path.read_text(encoding="utf-8")
+            marker_index = text.find(GOOD_BALLOT_MARKER)
+            if marker_index < 0:
+                continue
+
+            snippet = text[max(0, marker_index - 20) : marker_index + 120]
+            matches = NUMBER_FRAGMENT_PATTERN.findall(snippet)
+            if not matches:
+                continue
+
+            return extract_numeric_fragment(matches[0])
+
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,6 +363,52 @@ def build_submission(
                     "matched_party_name": "" if selected is None else selected.matched_party_name,
                 }
             )
+
+    submission_by_id = {row["id"]: row for row in submission_rows}
+    diagnostics_by_id = {row["id"]: row for row in diagnostics}
+    ocr_sum_by_doc: dict[str, int] = defaultdict(int)
+    unresolved_constituency_rows: dict[str, list[TemplateRow]] = defaultdict(list)
+
+    for row in ocr_rows:
+        vote_value = extract_numeric_fragment(row.vote)
+        if vote_value is not None:
+            ocr_sum_by_doc[row.id_doc] += vote_value
+
+    for template_row in template_rows:
+        if not template_row.doc_id.startswith("constituency_"):
+            continue
+        if not template_row.party_name.strip():
+            continue
+        if submission_by_id[template_row.id]["votes"] == "0":
+            unresolved_constituency_rows[template_row.doc_id].append(template_row)
+
+    for doc_id, missing_rows in unresolved_constituency_rows.items():
+        if len(missing_rows) != 1:
+            continue
+
+        good_ballots = extract_good_ballots_from_page_cache(doc_id)
+        if good_ballots is None:
+            continue
+
+        inferred_vote = good_ballots - ocr_sum_by_doc.get(doc_id, 0)
+        if inferred_vote <= 0 or inferred_vote >= good_ballots:
+            continue
+
+        target_row = missing_rows[0]
+        submission_by_id[target_row.id]["votes"] = str(inferred_vote)
+        diagnostics_by_id[target_row.id] = {
+            "id": target_row.id,
+            "doc_id": target_row.doc_id,
+            "row_num": target_row.row_num,
+            "party_name": target_row.party_name,
+            "predicted_vote": str(inferred_vote),
+            "match_source": "good_ballot_balance",
+            "match_score": 1.0,
+            "matched_row_num": "",
+            "matched_party_name": "",
+        }
+
+    diagnostics = list(diagnostics_by_id.values())
 
     summary = {
         "zero_votes": sum(1 for row in submission_rows if row["votes"] == "0"),
