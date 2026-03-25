@@ -14,11 +14,6 @@ PUNCTUATION_PATTERN = re.compile(r"[\s\-\.,/()_:;'\"]+")
 NUMBER_FRAGMENT_PATTERN = re.compile(r"[0-9๐-๙,]{2,}")
 THAI_DIGIT_TRANSLATION = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 GOOD_BALLOT_MARKER = "\u0e1a\u0e31\u0e15\u0e23\u0e14\u0e35"
-PAGE1_CACHE_DIRS = (
-    Path("temp_constituency_page1_missing_cache"),
-    Path("temp_constituency_page1_cache"),
-    Path("ocr_cache"),
-)
 COMMON_NAME_REPLACEMENTS = {
     "ประชาธิปัตย์ใหม่": "ประชาธิปไตยใหม่",
     "สังคมประชาธิปัตย์ใหม่": "สังคมประชาธิปไตยไทย",
@@ -62,8 +57,23 @@ def extract_numeric_fragment(value: str) -> int | None:
     return int(digits_only) if digits_only else None
 
 
+def iter_page1_cache_dirs() -> tuple[Path, ...]:
+    candidates = [Path("ocr_cache")]
+    candidates.extend(sorted(Path(".").glob("temp_constituency_page1*_cache")))
+
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        normalized = path.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_paths.append(path)
+    return tuple(unique_paths)
+
+
 def extract_good_ballots_from_page_cache(id_doc: str) -> int | None:
-    for cache_dir in PAGE1_CACHE_DIRS:
+    for cache_dir in iter_page1_cache_dirs():
         for candidate_name in (f"{id_doc}.md", f"{id_doc}_page1.md"):
             cache_path = cache_dir / candidate_name
             if not cache_path.exists():
